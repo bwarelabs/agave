@@ -330,6 +330,19 @@ impl JsonRpcRequestProcessor {
     }
 
     #[allow(deprecated)]
+    fn bank_at_slot_with_fallback(
+        &self,
+        slot: Slot,
+        commitment: Option<CommitmentConfig>,
+    ) -> Arc<Bank> {
+        let r_bank_forks = self.bank_forks.read().unwrap();
+        match r_bank_forks.get(slot) {
+            Some(bank) => bank,
+            None => self.bank(commitment),
+        }
+    }
+
+    #[allow(deprecated)]
     fn bank(&self, commitment: Option<CommitmentConfig>) -> Arc<Bank> {
         debug!("RPC commitment_config: {:?}", commitment);
 
@@ -569,6 +582,35 @@ impl JsonRpcRequestProcessor {
             commitment,
             min_context_slot,
         })?;
+        let encoding = encoding.unwrap_or(UiAccountEncoding::Base64);
+
+        let mut accounts = Vec::with_capacity(pubkeys.len());
+        for pubkey in pubkeys {
+            let bank = Arc::clone(&bank);
+            accounts.push(
+                self.runtime
+                    .spawn_blocking(move || {
+                        get_encoded_account(&bank, &pubkey, encoding, data_slice, None)
+                    })
+                    .await
+                    .expect("rpc: get_encoded_account panicked")?,
+            );
+        }
+        Ok(new_response(&bank, accounts))
+    }
+
+    pub async fn get_multiple_accounts_at_slot(
+        &self,
+        pubkeys: Vec<Pubkey>,
+        config: Option<RpcAccountInfoConfigAtSlot>,
+    ) -> Result<RpcResponse<Vec<Option<UiAccount>>>> {
+        let RpcAccountInfoConfigAtSlot {
+            encoding,
+            data_slice,
+            commitment,
+            slot,
+        } = config.unwrap_or_default();
+        let bank = self.bank_at_slot_with_fallback(slot, commitment);
         let encoding = encoding.unwrap_or(UiAccountEncoding::Base64);
 
         let mut accounts = Vec::with_capacity(pubkeys.len());
@@ -3197,6 +3239,14 @@ pub mod rpc_accounts {
             config: Option<RpcAccountInfoConfig>,
         ) -> BoxFuture<Result<RpcResponse<Vec<Option<UiAccount>>>>>;
 
+        #[rpc(meta, name = "getMultipleAccountsAtSlot")]
+        fn get_multiple_accounts_at_slot(
+            &self,
+            meta: Self::Metadata,
+            pubkey_strs: Vec<String>,
+            config: Option<RpcAccountInfoConfigAtSlot>,
+        ) -> BoxFuture<Result<RpcResponse<Vec<Option<UiAccount>>>>>;
+
         #[rpc(meta, name = "getBlockCommitment")]
         fn get_block_commitment(
             &self,
@@ -3268,6 +3318,35 @@ pub mod rpc_accounts {
                     .map(|pubkey_str| verify_pubkey(&pubkey_str))
                     .collect::<Result<Vec<_>>>()?;
                 meta.get_multiple_accounts(pubkeys, config).await
+            }
+            .boxed()
+        }
+
+        fn get_multiple_accounts_at_slot(
+            &self,
+            meta: Self::Metadata,
+            pubkey_strs: Vec<String>,
+            config: Option<RpcAccountInfoConfigAtSlot>,
+        ) -> BoxFuture<Result<RpcResponse<Vec<Option<UiAccount>>>>> {
+            debug!(
+                "get_multiple_accounts_at_slot rpc request received: {:?}",
+                pubkey_strs.len()
+            );
+            async move {
+                let max_multiple_accounts = meta
+                    .config
+                    .max_multiple_accounts
+                    .unwrap_or(MAX_MULTIPLE_ACCOUNTS);
+                if pubkey_strs.len() > max_multiple_accounts {
+                    return Err(Error::invalid_params(format!(
+                        "Too many inputs provided; max {max_multiple_accounts}"
+                    )));
+                }
+                let pubkeys = pubkey_strs
+                    .into_iter()
+                    .map(|pubkey_str| verify_pubkey(&pubkey_str))
+                    .collect::<Result<Vec<_>>>()?;
+                meta.get_multiple_accounts_at_slot(pubkeys, config).await
             }
             .boxed()
         }
